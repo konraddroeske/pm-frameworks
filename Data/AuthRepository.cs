@@ -1,12 +1,18 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using Microsoft.IdentityModel.Tokens;
+
 namespace PMFrameworks.Data;
 
 public class AuthRepository : IAuthRepository
 {
     private readonly DataContext _context;
+    private readonly IConfiguration _configuration;
 
-    public AuthRepository(DataContext context)
+    public AuthRepository(DataContext context, IConfiguration configuration)
     {
         _context = context;
+        _configuration = configuration;
     }
 
     public async Task<ServiceResponse<int>> Register(User user, string password)
@@ -33,15 +39,36 @@ public class AuthRepository : IAuthRepository
         return response;
     }
 
-    public Task<ServiceResponse<string>> Login(string username, string password)
+    public async Task<ServiceResponse<string>> Login(string username,
+        string password)
     {
-        throw new NotImplementedException();
+        var response = new ServiceResponse<string>();
+        var user = await _context.Users.FirstOrDefaultAsync(u =>
+            u.Username.ToLower().Equals(username.ToLower()));
+
+        if (user is null)
+        {
+            response.Success = false;
+            response.Message = "Credentials are invalid.";
+        }
+        else if (!VerifyPasswordHash(password, user.PasswordHash,
+                     user.PasswordSalt))
+        {
+            response.Success = false;
+            response.Message = "Credentials are invalid.";
+        }
+        else
+        {
+            response.Data = CreateToken(user);
+        }
+
+        return response;
     }
 
     public async Task<bool> UserExists(string username)
     {
         return await _context.Users.AnyAsync(u =>
-            u.Username.ToLower() == username.ToLower());
+            u.Username.ToLower().Equals(username.ToLower()));
     }
 
     private void CreatePasswordHash(string password, out byte[] passwordHash,
@@ -51,5 +78,53 @@ public class AuthRepository : IAuthRepository
         passwordSalt = hmac.Key;
         passwordHash =
             hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(password));
+    }
+
+    private bool VerifyPasswordHash(string password, byte[] passwordHash,
+        byte[] passwordSalt)
+    {
+        using var hmac = new System.Security.Cryptography.HMACSHA512(
+            passwordSalt);
+
+        var computedHash =
+            hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(password));
+
+        return computedHash.SequenceEqual(passwordHash);
+    }
+
+    private string CreateToken(User user)
+    {
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, user.Id.ToString()),
+            new(ClaimTypes.Name, user.Username)
+        };
+
+        var appSettingsToken =
+            Environment.GetEnvironmentVariable("JWT_SECRET_KEY");
+
+        if (appSettingsToken is null)
+        {
+            throw new Exception("AppSettings Token is null.");
+        }
+
+        var key =
+            new SymmetricSecurityKey(
+                System.Text.Encoding.UTF8.GetBytes(appSettingsToken));
+
+        var creds =
+            new SigningCredentials(key, SecurityAlgorithms.HmacSha512Signature);
+
+        var tokenDescriptor = new SecurityTokenDescriptor
+        {
+            Subject = new ClaimsIdentity(claims),
+            Expires = DateTime.Now.AddDays(1),
+            SigningCredentials = creds
+        };
+
+        var tokenHandler = new JwtSecurityTokenHandler();
+        var token = tokenHandler.CreateToken(tokenDescriptor);
+
+        return tokenHandler.WriteToken(token);
     }
 }
